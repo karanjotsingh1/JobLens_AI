@@ -28,7 +28,8 @@ import plotly.graph_objects  as go
 # Add project root to Python path so all imports work
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from config            import GROQ_API_KEY
+
+
 from models.skill_model import predict_top_skills, generate_shap_chart, load_artifacts
 from rag.resume_jd_rag  import (
     get_embeddings, load_pdf_to_chunks, build_vectorstore,
@@ -52,6 +53,17 @@ st.set_page_config(
     initial_sidebar_state = "expanded",
 )
 
+if "groq_api_key" not in st.session_state:
+    st.session_state["groq_api_key"] = ""
+
+user_api_key = st.sidebar.text_input(
+    "🔑 Enter your Groq API Key",
+    type="password"
+)
+
+if st.sidebar.button("Connect API"):
+    st.session_state["groq_api_key"] = user_api_key
+    
 # ─────────────────────────────────────────────────────────────
 # CUSTOM CSS — Clean, professional dark-friendly styling
 # ─────────────────────────────────────────────────────────────
@@ -195,10 +207,10 @@ with st.sidebar:
     st.divider()
 
     # Check if API key is configured
-    if not GROQ_API_KEY or GROQ_API_KEY == "your_groq_api_key_here":
-        st.error("⚠️ Groq API key not set!\nAdd it to your .env file.")
+    if st.session_state["groq_api_key"]:
+        st.success("✅ Groq API Connected")
     else:
-        st.success("✅ Groq API connected")
+        st.warning("⚠️ Please enter your Groq API Key above.")
 
     # Check if ML model is trained
     ml_model = load_ml_model_cached()
@@ -442,15 +454,30 @@ with tab2:
 
         # ── Skill Gap Analysis ───────────────────────────────
         st.markdown("---")
+
+        if not st.session_state["groq_api_key"]:
+            st.error("Please connect your Groq API Key first.")
+            st.stop()
+
         with st.spinner("🧠 Running gap analysis with AI..."):
-            llm           = ChatGroq(api_key=GROQ_API_KEY, model="llama-3.3-70b-versatile",
-                                     temperature=0.1)
-            resume_skills = extract_skills_from_text(resume_text, "resume")
-            jd_skills     = extract_skills_from_text(jd_text,     "jd")
-            gap_report    = generate_gap_report(
-                resume_skills, jd_skills, resume_text, jd_text,
-                target_role, target_level
-            )
+            llm = ChatGroq(
+                                api_key=st.session_state["groq_api_key"],
+                                model="llama-3.3-70b-versatile",
+                                temperature=0.1
+                                )
+            
+            resume_skills = extract_skills_from_text(resume_text,"resume",st.session_state["groq_api_key"])
+            jd_skills = extract_skills_from_text(jd_text, "jd", st.session_state["groq_api_key"])
+            gap_report = generate_gap_report(
+                                                resume_skills,
+                                                jd_skills,
+                                                resume_text,
+                                                jd_text,
+                                                target_role,
+                                                target_level,
+                                                st.session_state["groq_api_key"]
+                                                )
+            
             # Store gap report for use in Career Coach tab
             st.session_state["gap_analysis"] = gap_report
 
@@ -460,7 +487,7 @@ with tab2:
         # ── ATS Score ───────────────────────────────────────
         st.markdown("---")
         with st.spinner("🤖 Calculating ATS compatibility score..."):
-            ats_result = calculate_ats_score(resume_text, jd_text)
+            ats_result = calculate_ats_score(resume_text,jd_text,st.session_state["groq_api_key"])
 
         st.markdown("### 🤖 ATS Compatibility Analysis")
         st.markdown(ats_result["report"])
@@ -534,6 +561,7 @@ with tab3:
         # Show thinking spinner
         with st.spinner("🤔 Career Coach is thinking and searching the web..."):
             response = run_career_agent(
+                api_key=st.session_state["groq_api_key"],
                 user_query     = user_input,
                 resume_context = resume_ctx,
                 gap_analysis   = gap_ctx,
@@ -597,7 +625,7 @@ with tab4:
 
         if rewrite_btn and original_bullet.strip():
             with st.spinner("Crafting powerful bullet points..."):
-                rewritten = rewrite_full_resume_section(original_bullet, rw_role)
+                rewritten = rewrite_full_resume_section(original_bullet,rw_role,st.session_state["groq_api_key"])
             st.markdown(rewritten)
 
         elif rewrite_btn:
@@ -620,7 +648,7 @@ with tab4:
     if st.button("🔄 Rewrite Full Section", type="secondary", key="rewrite_full"):
         if full_section.strip():
             with st.spinner("Rewriting full section..."):
-                rewritten_section = rewrite_full_resume_section(full_section, target_role)
+                rewritten_section = rewrite_full_resume_section(full_section,target_role,st.session_state["groq_api_key"])
             st.markdown("#### ✅ Rewritten Section:")
             st.markdown(rewritten_section)
             # Allow download of rewritten section

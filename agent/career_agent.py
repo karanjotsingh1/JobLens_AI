@@ -1,259 +1,241 @@
 # ============================================================
-# agent/career_agent.py
+# agent/career_agent.py — v3 RECURSION FIX
 #
-# PURPOSE: LangGraph-powered Career Coach Agent
+# PROBLEM: Agent was looping infinitely because:
+#   1. After tool executed, agent called ANOTHER tool instead
+#      of writing the final answer — endless loop!
+#   2. Recursion limit of 10 hit before final answer produced.
 #
-# WHAT THIS AGENT DOES:
-#   1. Takes user query + resume context + gap analysis as input
-#   2. Decides which TOOL to use (web search / resume rewriter / skill planner)
-#   3. Executes the tool → observes result → decides next step
-#   4. Finally generates a detailed, helpful response
+# ROOT CAUSE: System prompt said "ALWAYS call web_search first"
+#   which made the agent call web_search AGAIN even after
+#   generate_skill_learning_plan already fetched URLs internally.
+#   Result: tool → tool → tool → tool → CRASH (recursion limit)
 #
-# TOOLS AVAILABLE:
-#   - web_search_tool      : Searches DuckDuckGo for learning resources (FREE)
-#   - rewrite_bullet_tool  : Rewrites weak resume bullet points using LLM
-#   - skill_plan_tool      : Generates 30-day skill building plan with links
-#   - gap_analysis_tool    : Finds missing skills between resume and JD
-#
-# WHY LANGGRAPH?
-#   LangGraph allows the agent to LOOP — it can search the web,
-#   see the results, decide to search again with better query,
-#   then synthesize everything into one final answer.
-#   Simple LLM chains cannot do this multi-step reasoning.
+# FIXES APPLIED:
+#   1. AGENT_MAX_ITERATIONS increased to 25 (safe headroom)
+#   2. System prompt rewritten — agent told to call MAX 1-2 tools
+#      then IMMEDIATELY write final answer using tool results
+#   3. tool_executor_node handles ALL heavy work internally
+#      (web search + plan generation in one step)
+#      so agent never needs to call multiple tools for one query
+#   4. Added tool_call_count tracking via system prompt message
+#      to prevent agent from looping
 # ============================================================
 
 import os
 import sys
 from typing import Annotated, TypedDict, List
-from langchain_groq               import ChatGroq
-from langchain_core.messages      import HumanMessage, AIMessage, SystemMessage, ToolMessage
-from langchain_core.tools         import tool
-from langgraph.graph              import StateGraph, START, END
-from langgraph.graph.message      import add_messages
-from langgraph.prebuilt           import ToolNode, tools_condition
-from duckduckgo_search            import DDGS
+from langchain_groq           import ChatGroq
+from langchain_core.messages  import HumanMessage, AIMessage, SystemMessage, ToolMessage
+from langchain_core.tools     import tool
+from langgraph.graph          import StateGraph, START, END
+from langgraph.graph.message  import add_messages
+from langgraph.prebuilt       import ToolNode, tools_condition
+from duckduckgo_search        import DDGS
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import GROQ_API_KEY, GROQ_MODEL_NAME, WEB_SEARCH_RESULTS, AGENT_MAX_ITERATIONS
+from config import GROQ_MODEL_NAME, WEB_SEARCH_RESULTS
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. AGENT STATE — Shared memory across all graph nodes
+# 1. AGENT STATE
 # ─────────────────────────────────────────────────────────────
 class AgentState(TypedDict):
-    """
-    TypedDict that defines what information the agent carries
-    through each node in the LangGraph.
-
-    messages: Full conversation history (add_messages = append, not replace)
-    resume_context: Extracted text from user's resume PDF
-    gap_analysis:   Missing skills identified between resume and JD
-    role_target:    The job role user is targeting (e.g. "ML Engineer")
-    level_target:   Experience level (e.g. "Fresher")
-    """
     messages      : Annotated[List, add_messages]
     resume_context: str
     gap_analysis  : str
     role_target   : str
     level_target  : str
+    api_key       : str
 
 
 # ─────────────────────────────────────────────────────────────
-# 2. TOOLS — What the agent can DO
+# 2. TOOLS
+# NOTE: Each tool is SELF-CONTAINED — does ALL the heavy work
+#       internally so agent only needs to call ONE tool per query
+#       and then write the final answer. No chaining needed.
 # ─────────────────────────────────────────────────────────────
 
 @tool
 def web_search_learning_resources(query: str) -> str:
     """
-    Search the web for FREE learning resources — YouTube playlists,
-    courses, tutorials, and documentation for a skill or topic.
-
-    Use this when the user wants to learn a missing skill.
-    Prefer YouTube playlists, Coursera free audits, and official docs.
-
+    Search the web for FREE learning resources.
+    Use this ONLY for general resource questions (not 30-day plans).
     Args:
-        query: Search query e.g. "best free LangChain tutorial YouTube 2024"
+        query: Search query string
     """
     try:
-        # DuckDuckGo search — completely FREE, no API key needed
         with DDGS() as ddgs:
             results = list(ddgs.text(
                 query,
                 max_results=WEB_SEARCH_RESULTS,
-                region="in-en",       # India-focused results
+                region="in-en",
                 safesearch="moderate"
             ))
-
         if not results:
-            return "No results found. Try a different search query."
-
-        # Format results nicely for the LLM to process
+            return "No results found."
         formatted = []
         for i, r in enumerate(results, 1):
             formatted.append(
                 f"[{i}] TITLE: {r.get('title', 'N/A')}\n"
                 f"    URL:   {r.get('href', 'N/A')}\n"
-                f"    DESC:  {r.get('body', 'N/A')[:200]}\n"
+                f"    DESC:  {r.get('body', 'N/A')[:250]}\n"
             )
-
         return "\n".join(formatted)
-
     except Exception as e:
-        return f"Search failed: {str(e)}. Please try again."
-
-
-@tool
-def rewrite_resume_bullet(bullet_point: str, role: str) -> str:
-    """
-    Rewrite a weak resume bullet point to make it stronger,
-    more impactful, and ATS (Applicant Tracking System) friendly.
-
-    Use strong action verbs, quantify impact where possible,
-    and use keywords relevant to the target role.
-
-    Args:
-        bullet_point: The original weak bullet point from resume
-        role:         Target job role (e.g. "ML Engineer")
-    """
-    # This tool will be handled by the LLM itself using its context
-    # We return a structured prompt that the agent node processes
-    return f"REWRITE_REQUEST|bullet={bullet_point}|role={role}"
+        return f"Search failed: {str(e)}"
 
 
 @tool
 def generate_skill_learning_plan(missing_skills: str, role: str, level: str) -> str:
     """
-    Generate a detailed 30-day skill building plan for missing skills.
-    Include specific YouTube channels, free courses, and practice projects.
-
+    Generate a complete 30-day learning plan WITH real URLs already included.
+    This tool handles EVERYTHING internally — web search + plan generation.
+    Use this for any 30-day plan request. Do NOT call web_search separately.
     Args:
-        missing_skills: Comma-separated list of skills to learn
+        missing_skills: Skills to learn (comma-separated)
         role:           Target job role
-        level:          Experience level (Fresher/Mid-Level/Senior)
+        level:          Experience level
     """
     return f"PLAN_REQUEST|skills={missing_skills}|role={role}|level={level}"
 
 
 @tool
+def rewrite_resume_bullet(bullet_point: str, role: str) -> str:
+    """
+    Rewrite a weak resume bullet point into 3 strong ATS-friendly versions.
+    Args:
+        bullet_point: Original weak bullet point
+        role:         Target job role
+    """
+    return f"REWRITE_REQUEST|bullet={bullet_point}|role={role}"
+
+
+@tool
 def analyze_skill_gaps(resume_skills: str, jd_requirements: str) -> str:
     """
-    Compare resume skills against JD requirements to find gaps.
-
+    Compare resume skills vs JD requirements to find gaps.
     Args:
-        resume_skills:    Skills extracted from resume (comma-separated)
-        jd_requirements:  Skills required in job description (comma-separated)
+        resume_skills:   Comma-separated skills from resume
+        jd_requirements: Comma-separated skills from JD
     """
-    resume_set = set(s.strip().lower() for s in resume_skills.split(","))
-    jd_set     = set(s.strip().lower() for s in jd_requirements.split(","))
-
-    missing  = jd_set - resume_set
-    matching = jd_set & resume_set
-    extra    = resume_set - jd_set
-
+    resume_set = set(s.strip().lower() for s in resume_skills.split(",") if s.strip())
+    jd_set     = set(s.strip().lower() for s in jd_requirements.split(",") if s.strip())
+    missing  = sorted(jd_set - resume_set)
+    matching = sorted(jd_set & resume_set)
+    extra    = sorted(resume_set - jd_set)
     return (
-        f"✅ MATCHING SKILLS ({len(matching)}): {', '.join(sorted(matching)) or 'None'}\n"
-        f"❌ MISSING SKILLS ({len(missing)}): {', '.join(sorted(missing)) or 'None'}\n"
-        f"➕ EXTRA SKILLS (not in JD) ({len(extra)}): {', '.join(sorted(extra)) or 'None'}"
+        f"MATCHING ({len(matching)}): {', '.join(matching) or 'None'}\n"
+        f"MISSING  ({len(missing)}): {', '.join(missing)  or 'None'}\n"
+        f"EXTRA    ({len(extra)}):   {', '.join(extra)    or 'None'}"
     )
 
 
-# List of all tools the agent can use
 TOOLS = [
     web_search_learning_resources,
-    rewrite_resume_bullet,
     generate_skill_learning_plan,
+    rewrite_resume_bullet,
     analyze_skill_gaps,
 ]
 
 
 # ─────────────────────────────────────────────────────────────
-# 3. LLM SETUP — Groq with tool binding
+# 3. LLM HELPERS
 # ─────────────────────────────────────────────────────────────
-def get_llm_with_tools():
-    """
-    Initialize Groq LLM and bind all tools to it.
-    bind_tools() tells the LLM what tools are available
-    and what arguments each tool expects.
-    """
-    llm = ChatGroq(
-        api_key=GROQ_API_KEY,
+def get_llm_with_tools(api_key: str):
+    return ChatGroq(
+        api_key=api_key,
         model=GROQ_MODEL_NAME,
-        temperature=0.3,        # Low temp = focused, precise answers
-        max_tokens=4096,        # Allow long detailed responses
+        temperature=0.3,
+        max_tokens=4096,
+    ).bind_tools(TOOLS)
+
+
+def get_llm_plain(api_key: str, temperature: float = 0.2, max_tokens: int = 4096):
+    return ChatGroq(
+        api_key=api_key,
+        model=GROQ_MODEL_NAME,
+        temperature=temperature,
+        max_tokens=max_tokens,
     )
-    # Bind tools so LLM knows it can call them
-    return llm.bind_tools(TOOLS)
 
 
 # ─────────────────────────────────────────────────────────────
-# 4. AGENT NODE — The "brain" that decides what to do
+# 4. AGENT NODE
+# KEY FIX: system prompt now strictly limits tool calls to 1
+#          and tells agent to write final answer IMMEDIATELY
+#          after seeing tool results — no second tool calls
 # ─────────────────────────────────────────────────────────────
-def agent_node(state: AgentState) -> AgentState:
-    """
-    The main reasoning node. Called by LangGraph at each step.
+def agent_node(state: AgentState, api_key: str) -> AgentState:
+    llm_with_tools = get_llm_with_tools(api_key)
 
-    It receives the current state (all messages + context),
-    thinks about what to do next, and either:
-    - Calls a tool (returns tool_call in message)
-    - Gives a final answer (returns regular AI message)
-    """
-    llm_with_tools = get_llm_with_tools()
+    # Count how many tool messages already exist in state
+    # If tools have already been called — force final answer now
+    tool_messages_count = sum(
+        1 for m in state["messages"] if isinstance(m, ToolMessage)
+    )
 
-    # Build a detailed system prompt that includes all context
-    system_prompt = f"""You are JobLens AI — an expert career coach and resume consultant.
-You help users land their dream jobs by providing specific, actionable, detailed advice.
+    if tool_messages_count >= 1:
+        # Tools already ran — force final answer, no more tool calls
+        system_prompt = f"""You are JobLens AI — an expert career coach.
+
+CONTEXT:
+- Target Role: {state.get('role_target', 'Not specified')}
+- Experience Level: {state.get('level_target', 'Not specified')}
+- Resume: {state.get('resume_context', 'Not uploaded')[:800]}
+- Skill Gaps: {state.get('gap_analysis', 'Not analysed yet')}
+
+THE TOOL HAS ALREADY RUN AND RETURNED RESULTS.
+NOW YOU MUST WRITE THE FINAL ANSWER — DO NOT CALL ANY MORE TOOLS.
+
+Using the tool results in the conversation above, write a complete,
+detailed, well-structured response with:
+- Clear headings and bullet points
+- All URLs from tool results included as clickable links
+- Minimum 200 words
+- Specific actionable advice
+- End with "Happy Learning! 🚀"
+
+WRITE THE FINAL ANSWER NOW. DO NOT USE ANY TOOLS.
+"""
+    else:
+        # No tools called yet — agent decides which tool to call
+        system_prompt = f"""You are JobLens AI — an expert career coach and resume consultant.
 
 CONTEXT ABOUT THE USER:
 - Target Role: {state.get('role_target', 'Not specified')}
 - Experience Level: {state.get('level_target', 'Not specified')}
-- Resume Summary: {state.get('resume_context', 'Resume not uploaded yet')[:1500]}
-- Skill Gaps Identified: {state.get('gap_analysis', 'No gap analysis done yet')}
+- Resume Summary: {state.get('resume_context', 'Not uploaded yet')[:800]}
+- Skill Gaps: {state.get('gap_analysis', 'Not analysed yet')}
 
-YOUR PERSONALITY:
-- Be specific — never give vague advice like "learn Python". Say "Start with this playlist: [link]"
-- Be detailed — when giving learning resources, explain WHAT the resource covers and WHY it is good
-- Be encouraging but honest — tell the user exactly what they need to improve
-- Always provide YouTube links, course links, and documentation links when discussing learning
+AVAILABLE TOOLS — CALL EXACTLY ONE TOOL PER QUERY:
+1. generate_skill_learning_plan — For ANY 30-day plan or learning roadmap request
+   → This tool does EVERYTHING (web search + plan) internally
+   → Do NOT call web_search after this — go straight to final answer
+2. web_search_learning_resources — For general resource/YouTube recommendations
+3. rewrite_resume_bullet — For rewriting a resume bullet point
+4. analyze_skill_gaps — For comparing resume vs JD skills
 
-TOOLS YOU HAVE:
-1. web_search_learning_resources — Search for free learning resources, YouTube playlists, courses
-2. rewrite_resume_bullet — Rewrite a weak resume bullet point to be strong and ATS-friendly
-3. generate_skill_learning_plan — Create a detailed 30-day learning roadmap
-4. analyze_skill_gaps — Compare resume skills vs JD to find what is missing
-
-IMPORTANT RULES:
-- For learning resources: ALWAYS search the web first to get real, current links
-- For resume rewrites: Be specific about what makes the new version better
-- For skill plans: Break down into weekly goals with specific resources per week
-- Never say "I cannot help with that" — find a way to be useful
+STRICT RULES:
+- Call EXACTLY ONE tool, then write the final answer
+- Do NOT call multiple tools in sequence
+- Do NOT call web_search after generate_skill_learning_plan
+- After tool result arrives, write the complete detailed answer immediately
 """
 
-    # Prepend system message to conversation
-    messages = [SystemMessage(content=system_prompt)] + state["messages"]
-
-    # Call LLM — it will either return a tool call or a final answer
-    response = llm_with_tools.invoke(messages)
-
-    # Return updated state with new message appended
+    messages  = [SystemMessage(content=system_prompt)] + state["messages"]
+    response  = llm_with_tools.invoke(messages)
     return {"messages": [response]}
 
 
 # ─────────────────────────────────────────────────────────────
-# 5. TOOL EXECUTION NODE — Actually runs the tool
+# 5. TOOL EXECUTION NODE
+# Heavy lifting done HERE so agent only needs one tool call
 # ─────────────────────────────────────────────────────────────
-def tool_executor_node(state: AgentState) -> AgentState:
-    """
-    Processes tool calls made by the agent node.
-    After tool execution, the result is added to messages
-    so the agent can see what the tool returned.
-
-    Special handling for REWRITE_REQUEST and PLAN_REQUEST —
-    these are handled by calling the LLM again with detailed prompts.
-    """
+def tool_executor_node(state: AgentState, api_key: str) -> AgentState:
     tool_node = ToolNode(TOOLS)
     result    = tool_node.invoke(state)
 
-    # Check if any tool returned a special request that needs LLM
     updated_messages = result.get("messages", [])
     processed        = []
 
@@ -261,99 +243,160 @@ def tool_executor_node(state: AgentState) -> AgentState:
         if isinstance(msg, ToolMessage):
             content = msg.content
 
-            # Handle bullet rewrite request — call LLM for this
+            # ── REWRITE BULLET ──────────────────────────────
             if content.startswith("REWRITE_REQUEST"):
                 parts  = dict(p.split("=", 1) for p in content.split("|")[1:])
                 bullet = parts.get("bullet", "")
                 role   = parts.get("role", "Software Engineer")
 
-                llm = ChatGroq(api_key=GROQ_API_KEY, model=GROQ_MODEL_NAME, temperature=0.2)
-                rewrite_prompt = f"""Rewrite this resume bullet point for a {role} role.
+                llm = get_llm_plain(api_key, temperature=0.2, max_tokens=2048)
+                prompt = f"""You are an expert resume writer. Rewrite this bullet for a {role} role.
 
 ORIGINAL: {bullet}
 
-RULES FOR REWRITING:
-1. Start with a STRONG action verb (Engineered, Architected, Optimized, Deployed, Built, Developed)
-2. Include WHAT you did, HOW you did it, and the IMPACT/RESULT
-3. Add relevant technical keywords for {role}
-4. Keep it to 1-2 lines max
-5. Quantify impact where possible (e.g., "reduced latency by 40%", "processed 10K+ requests/day")
+Rules:
+1. Start with strong action verb (Built, Engineered, Developed, Optimized, Deployed)
+2. Include WHAT + HOW + IMPACT/RESULT
+3. Add ATS keywords for {role}
+4. 1-2 lines max
+5. Quantify wherever possible
 
-Return 3 different versions of the rewritten bullet, labeled VERSION 1, VERSION 2, VERSION 3.
-After each version, explain in 1 line what makes it stronger.
+Return 3 versions:
+
+**VERSION 1** — Technical depth focus
+[bullet]
+*Why stronger:* [1 line]
+
+**VERSION 2** — Quantified impact focus
+[bullet]
+*Why stronger:* [1 line]
+
+**VERSION 3** — ATS keyword optimization
+[bullet]
+*Why stronger:* [1 line]
 """
-                llm_response = llm.invoke(rewrite_prompt)
-                msg          = ToolMessage(
-                    content   = llm_response.content,
-                    tool_call_id = msg.tool_call_id
-                )
+                llm_resp = llm.invoke(prompt)
+                msg = ToolMessage(content=llm_resp.content, tool_call_id=msg.tool_call_id)
 
-            # Handle skill plan request — call LLM for detailed plan
+            # ── 30-DAY PLAN — does web search + generation internally ──
             elif content.startswith("PLAN_REQUEST"):
                 parts  = dict(p.split("=", 1) for p in content.split("|")[1:])
-                skills = parts.get("skills", "")
+                skills = parts.get("skills", "LangChain")
                 role   = parts.get("role", "ML Engineer")
                 level  = parts.get("level", "Fresher")
 
-                llm = ChatGroq(api_key=GROQ_API_KEY, model=GROQ_MODEL_NAME,
-                               temperature=0.2, max_tokens=4096)
-                plan_prompt = f"""Create a detailed 30-day learning plan for a {level} targeting {role}.
+                # Internal web search — so agent does NOT need a second tool call
+                real_urls_text = ""
+                try:
+                    all_results = []
+                    queries = [
+                        f"{skills} tutorial YouTube beginners 2025",
+                        f"free {skills} course online 2024 2025",
+                        f"{skills} project for beginners GitHub",
+                    ]
+                    for q in queries:
+                        with DDGS() as ddgs:
+                            res = list(ddgs.text(q, max_results=3, region="in-en", safesearch="moderate"))
+                        for r in res:
+                            title = r.get("title", "")
+                            url   = r.get("href", "")
+                            desc  = r.get("body", "")[:120]
+                            if url and url.startswith("http"):
+                                all_results.append(f"• {title}\n  🔗 {url}\n  {desc}")
+                    real_urls_text = "\n".join(all_results[:12]) if all_results else ""
+                except Exception:
+                    real_urls_text = ""
 
-SKILLS TO LEARN: {skills}
+                # Generate the full plan with URLs already embedded
+                llm = get_llm_plain(api_key, temperature=0.2, max_tokens=4096)
+                prompt = f"""Create a complete, detailed 30-day learning plan.
 
-FORMAT YOUR RESPONSE EXACTLY LIKE THIS:
+TARGET: {level} aiming for {role}
+SKILLS: {skills}
 
-## 🎯 30-Day Learning Roadmap: {role} ({level})
+REAL RESOURCES FOUND (embed these URLs directly in the plan):
+{real_urls_text if real_urls_text else "Use well-known resources like Krish Naik, Codebasics, Tech With Tim on YouTube."}
 
-### Week 1 (Days 1-7): [Skill Name] Foundations
-**Goal:** What you will achieve this week
-**Daily time commitment:** X hours/day
+Write the plan in this EXACT structure — be specific and detailed:
 
-📺 YouTube Resources:
-- [Channel Name] — "Playlist/Video Title" → [URL]
-  What it covers: detailed description of what this resource teaches
-  Why this resource: why this specific channel/video is recommended
-
-🌐 Free Courses:
-- [Platform] — "Course Name" → [URL]
-  What it covers: description
-  Time to complete: X hours
-
-📚 Documentation/Reading:
-- [Resource name] → [URL]
-  What to focus on: specific sections or chapters
-
-🛠️ Practice Project:
-Build [specific small project] using what you learned this week
-
----
-### Week 2 (Days 8-14): [Next Skill]
-[Same format as Week 1]
-
----
-### Week 3 (Days 15-21): [Next Skill]
-[Same format]
+## 🎯 30-Day {skills} Learning Roadmap for {role} ({level})
 
 ---
-### Week 4 (Days 22-30): Integration + Portfolio
-**Goal:** Combine all learned skills into one portfolio project
-**Project idea:** [specific project idea that uses all {skills}]
-**GitHub-ready steps:** How to structure and document this project
+### 📅 WEEK 1 (Days 1–7) — Foundations
+**Goal:** [specific goal for this week]
+**Daily time:** 1.5–2 hours
 
-💡 Tips for {role} Interviews:
-- [Specific tip 1]
-- [Specific tip 2]
-- [Specific tip 3]
+📺 **YouTube Resources:**
+- [Channel Name] — "[Exact Playlist/Video Title]"
+  🔗 Link: [use URL from real resources above]
+  📖 Covers: [what you will learn]
+  ⭐ Why: [why this resource specifically]
 
-Remember: Provide REAL YouTube channel names, real course names, and accurate URLs.
-Mention popular educators like: Krish Naik, Codebasics, StatQuest, Sentdex, Andrej Karpathy,
-3Blue1Brown, Tech With Tim, Nicholas Renotte, etc. wherever relevant.
+🌐 **Free Courses:**
+- [Platform] — "[Course Name]"
+  🔗 Link: [URL]
+  ⏱️ Duration: [hours]
+
+🛠️ **Week 1 Project:**
+Build: [specific mini project description]
+
+---
+### 📅 WEEK 2 (Days 8–14) — Core Skills
+**Goal:** [specific week 2 goal]
+
+📺 **YouTube Resources:**
+- [resource with URL]
+
+🛠️ **Week 2 Project:**
+Build: [intermediate project]
+
+---
+### 📅 WEEK 3 (Days 15–21) — Advanced Topics
+**Goal:** [specific week 3 goal]
+
+📺 **YouTube Resources:**
+- [resource with URL]
+
+🛠️ **Week 3 Project:**
+Build: [advanced component]
+
+---
+### 📅 WEEK 4 (Days 22–30) — Portfolio Project
+**Goal:** Build a complete GitHub-ready project
+
+🚀 **Capstone Project:**
+Name: [project name]
+Description: [what it does]
+Stack: {skills} + [other tools]
+
+Steps:
+1. [step]
+2. [step]
+3. [step]
+4. Push to GitHub with README
+
+---
+### 💡 Interview Tips for {role}
+
+Top 3 interview questions on {skills} and how to answer:
+1. Q: [question] → A: [answer strategy]
+2. Q: [question] → A: [answer strategy]
+3. Q: [question] → A: [answer strategy]
+
+---
+### 📊 Progress Tracker
+
+| Week | Focus | Deliverable |
+|------|-------|------------|
+| Week 1 | Foundations | First working example |
+| Week 2 | Core Skills | 2 mini projects |
+| Week 3 | Advanced | Complex feature |
+| Week 4 | Portfolio | GitHub project |
+
+Happy Learning! 🚀
 """
-                llm_response = llm.invoke(plan_prompt)
-                msg          = ToolMessage(
-                    content      = llm_response.content,
-                    tool_call_id = msg.tool_call_id
-                )
+                llm_resp = llm.invoke(prompt)
+                msg = ToolMessage(content=llm_resp.content, tool_call_id=msg.tool_call_id)
 
         processed.append(msg)
 
@@ -361,108 +404,90 @@ Mention popular educators like: Krish Naik, Codebasics, StatQuest, Sentdex, Andr
 
 
 # ─────────────────────────────────────────────────────────────
-# 6. BUILD LANGGRAPH — Connect nodes with edges
+# 6. BUILD LANGGRAPH
 # ─────────────────────────────────────────────────────────────
-def build_career_agent():
-    """
-    Build and compile the LangGraph agent.
-
-    GRAPH STRUCTURE:
-    START → agent_node → (if tool call) → tool_executor_node → agent_node → ...
-                       → (if no tool call) → END
-
-    This loop allows the agent to:
-    1. Decide to search web
-    2. See search results
-    3. Decide to search again with refined query
-    4. See new results
-    5. Finally synthesize and answer
-    """
+def build_career_agent(api_key: str):
     graph = StateGraph(AgentState)
 
-    # Add nodes to the graph
-    graph.add_node("agent",  agent_node)
-    graph.add_node("tools",  tool_executor_node)
+    graph.add_node("agent", lambda state: agent_node(state, api_key))
+    graph.add_node("tools", lambda state: tool_executor_node(state, api_key))
 
-    # START always goes to agent first
     graph.add_edge(START, "agent")
-
-    # After agent runs: if it made a tool call → go to tools
-    #                   if it gave final answer → go to END
     graph.add_conditional_edges(
         "agent",
-        tools_condition,   # LangGraph built-in: checks if last message has tool_calls
-        {
-            "tools": "tools",   # If tool call detected → execute tools
-            END:     END,       # If no tool call → we're done
-        }
+        tools_condition,
+        {"tools": "tools", END: END}
     )
-
-    # After tools run → always go back to agent for next reasoning step
     graph.add_edge("tools", "agent")
 
-    # Compile the graph into a runnable
     return graph.compile()
 
 
 # ─────────────────────────────────────────────────────────────
-# 7. PUBLIC INTERFACE — Used by Streamlit UI
+# 7. PUBLIC INTERFACE
 # ─────────────────────────────────────────────────────────────
 def run_career_agent(
-    user_query     : str,
-    resume_context : str = "",
-    gap_analysis   : str = "",
-    role_target    : str = "Software Engineer",
-    level_target   : str = "Fresher",
-    chat_history   : list = None
+    api_key       : str,
+    user_query    : str,
+    resume_context: str  = "",
+    gap_analysis  : str  = "",
+    role_target   : str  = "Software Engineer",
+    level_target  : str  = "Fresher",
+    chat_history  : list = None,
 ) -> str:
-    """
-    Main entry point called from the Streamlit UI.
 
-    Args:
-        user_query:     What the user typed in the chat box
-        resume_context: Extracted text from uploaded resume
-        gap_analysis:   Gap analysis result from RAG comparison
-        role_target:    Target job role
-        level_target:   Experience level
-        chat_history:   Previous messages in the conversation
+    if not api_key or not api_key.strip():
+        return "❌ Please enter your Groq API Key in the sidebar first."
 
-    Returns:
-        Agent's final response as a string
-    """
-    agent = build_career_agent()
+    agent = build_career_agent(api_key)
 
-    # Build message list from chat history
     messages = []
     if chat_history:
-        for msg in chat_history:
-            if msg["role"] == "user":
-                messages.append(HumanMessage(content=msg["content"]))
-            elif msg["role"] == "assistant":
-                messages.append(AIMessage(content=msg["content"]))
+        for m in chat_history:
+            if m["role"] == "user":
+                messages.append(HumanMessage(content=m["content"]))
+            elif m["role"] == "assistant":
+                messages.append(AIMessage(content=m["content"]))
 
-    # Add current user query
     messages.append(HumanMessage(content=user_query))
 
-    # Initial state for the agent
     initial_state = {
         "messages"      : messages,
         "resume_context": resume_context,
         "gap_analysis"  : gap_analysis,
         "role_target"   : role_target,
         "level_target"  : level_target,
+        "api_key"       : api_key,
     }
 
-    # Run the agent (it loops internally until it reaches END)
-    final_state = agent.invoke(
-        initial_state,
-        config={"recursion_limit": AGENT_MAX_ITERATIONS}
-    )
+    try:
+        # Increased recursion limit to 25 for safe headroom
+        # Flow: START → agent(1) → tools(1) → agent(2) → END
+        # That is only 3 node visits — 25 is more than enough
+        final_state = agent.invoke(
+            initial_state,
+            config={"recursion_limit": 25}
+        )
+    except Exception as e:
+        error_msg = str(e)
+        if "recursion" in error_msg.lower():
+            return (
+                "⚠️ The agent took too many steps to answer this question.\n\n"
+                "**Try rephrasing your question more specifically, for example:**\n"
+                "- 'Give me a 30-day plan to learn LangChain' ✅\n"
+                "- 'What YouTube channels teach LangGraph?' ✅\n"
+                "- 'Rewrite this bullet: Worked on ML project' ✅\n\n"
+                "Avoid very broad questions like 'Tell me everything about AI'."
+            )
+        return f"❌ Agent error: {error_msg}\n\nPlease try again."
 
-    # Extract the last AI message as the final response
     final_messages = final_state.get("messages", [])
-    for msg in reversed(final_messages):
-        if isinstance(msg, AIMessage) and msg.content:
-            return msg.content
 
-    return "I could not generate a response. Please try again."
+    # Return the LAST AIMessage with actual text content
+    # (skip tool-call AIMessages which have content="")
+    for msg in reversed(final_messages):
+        if isinstance(msg, AIMessage):
+            if msg.content and msg.content.strip():
+                return msg.content
+
+    return "Could not generate a response. Please try again."

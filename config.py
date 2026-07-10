@@ -11,7 +11,6 @@ load_dotenv()
 
 # ── LLM Settings ────────────────────────────────────────────
 # Groq is free. Best free model right now is llama-3.3-70b-versatile
-GROQ_API_KEY    = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL_NAME = os.getenv("GROQ_MODEL_NAME", "llama-3.3-70b-versatile")
 
 # ── Embedding Settings ───────────────────────────────────────

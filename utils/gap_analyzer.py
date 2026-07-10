@@ -11,20 +11,20 @@ from langchain_groq          import ChatGroq
 from langchain_core.prompts  import ChatPromptTemplate
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import GROQ_API_KEY, GROQ_MODEL_NAME
+from config import GROQ_MODEL_NAME
 
 
-def get_llm(temperature: float = 0.2) -> ChatGroq:
+def get_llm(api_key: str, temperature: float = 0.2) -> ChatGroq:
     """Initialize Groq LLM — used across all utility functions."""
     return ChatGroq(
-        api_key   = GROQ_API_KEY,
+        api_key=api_key,
         model     = GROQ_MODEL_NAME,
         temperature = temperature,
         max_tokens  = 3000,
     )
 
 
-def extract_skills_from_text(text: str, doc_type: str = "resume") -> list:
+def extract_skills_from_text(text: str,doc_type: str = "resume",api_key: str = "") -> list:
     """
     Use LLM to extract all technical skills mentioned in text.
 
@@ -35,7 +35,7 @@ def extract_skills_from_text(text: str, doc_type: str = "resume") -> list:
     Returns:
         List of skill strings
     """
-    llm = get_llm(temperature=0.1)
+    llm = get_llm(api_key, temperature=0.1)
 
     if doc_type == "resume":
         instruction = "Extract ALL technical skills, tools, frameworks, and languages from this resume."
@@ -66,6 +66,7 @@ def generate_gap_report(
     jd_text       : str,
     role          : str,
     level         : str,
+    api_key: str
 ) -> str:
     """
     Generate a detailed gap analysis report comparing resume to JD.
@@ -75,7 +76,7 @@ def generate_gap_report(
     - Missing skills (red zone — need to learn)
     - Improvement suggestions per missing skill
     """
-    llm = get_llm(temperature=0.2)
+    llm = get_llm(api_key, temperature=0.2)
 
     # Compute sets for matching/missing
     resume_set  = set(s.lower() for s in resume_skills)
@@ -121,7 +122,11 @@ Specific, actionable steps the candidate should start immediately.
     return response.content
 
 
-def rewrite_full_resume_section(section_text: str, role: str) -> str:
+def rewrite_full_resume_section(
+    section_text: str,
+    role: str,
+    api_key: str
+):
     """
     Rewrite an entire resume section (e.g., Projects or Experience)
     to be more impactful for the target role.
@@ -133,7 +138,7 @@ def rewrite_full_resume_section(section_text: str, role: str) -> str:
     Returns:
         Rewritten section as string
     """
-    llm = get_llm(temperature=0.3)
+    llm = get_llm(api_key, temperature=0.3)
 
     prompt = f"""You are an expert resume writer specializing in tech roles.
 Rewrite the following resume section for a {role} position.
@@ -156,14 +161,14 @@ REWRITTEN SECTION:"""
     return response.content
 
 
-def calculate_ats_score(resume_text: str, jd_text: str) -> dict:
+def calculate_ats_score(resume_text, jd_text, api_key):
     """
     Calculate ATS (Applicant Tracking System) compatibility score.
     ATS systems scan resumes for keyword matches with JD.
 
     Returns dict with score and detailed feedback.
     """
-    llm = get_llm(temperature=0.1)
+    llm = get_llm(api_key, temperature=0.1)
 
     prompt = f"""You are an ATS (Applicant Tracking System) simulator.
 Analyze how well this resume would perform when scanned by an ATS for this job.
